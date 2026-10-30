@@ -1,0 +1,289 @@
+#!/bin/zsh
+set -euo pipefail
+
+# craft-cli-sync
+# Synchronize the CLIs of all ArtCraft Launcher-managed apps
+# with their installed desktop versions.
+#
+# Usage:
+#   craft-cli-sync
+#   craft-cli-sync --check
+#   craft-cli-sync --dry-run
+
+# Apps installed by ArtCraft Launcher, keyed by app id.
+INSTALLED_JSON="$HOME/Library/Application Support/ArtCraft Launcher/installed.json"
+
+# Each app id is also its repository name.
+OWNER="storytold"
+
+BIN_DIR="$HOME/.local/bin"
+
+MODE="${1:-sync}"
+
+case "$MODE" in
+  sync|--check|--dry-run) ;;
+  *)
+    echo "Usage: craft-cli-sync [--check|--dry-run]" >&2
+    exit 2
+    ;;
+esac
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+for cmd in curl jq unzip shasum mktemp find awk; do
+  command -v "$cmd" >/dev/null || die "Missing dependency: $cmd"
+done
+
+ARCH=$(uname -m)
+
+[[ "$ARCH" == arm64 || "$ARCH" == x86_64 ]] \
+  || die "Unsupported architecture: $ARCH"
+
+# Match the complete version number in CLI output.
+version_matches() {
+  local output="$1"
+  local escaped="${VERSION//./\\.}"
+  local pattern="(^|[^0-9.])${escaped}([^0-9.]|$)"
+
+  [[ "$output" =~ $pattern ]]
+}
+
+# Runs in a subshell per app: `die` and `exit` only end that app.
+sync_app() {
+  set -e
+
+  local ID="$1"
+  local APP="$2"
+  local NAME="${${APP:t}%.app}"
+  local REPO="$OWNER/$ID"
+  local CLI="$ID-cli"
+  local BIN="$BIN_DIR/$CLI"
+
+  echo "== $NAME"
+
+  [[ "$ID" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+    || die "Unexpected app id: $ID"
+
+  if [[ ! -d "$APP" ]]; then
+    echo "App not found at $APP, skipping."
+    exit 0
+  fi
+
+  local INFO="$APP/Contents/Info.plist"
+
+  VERSION=$(/usr/libexec/PlistBuddy \
+    -c "Print :CFBundleShortVersionString" "$INFO") \
+    || die "Cannot read app version"
+
+  # zsh regex: do not quote the regex operand.
+  [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] \
+    || die "Unexpected app version: $VERSION"
+
+  local INSTALLED="not installed"
+
+  if [[ -x "$BIN" ]]; then
+    INSTALLED=$("$BIN" --version 2>/dev/null || true)
+  fi
+
+  echo "Desktop: $VERSION"
+  echo "CLI:     $INSTALLED"
+
+  if version_matches "$INSTALLED"; then
+    echo "Already synchronized."
+    exit 0
+  fi
+
+  local API="https://api.github.com/repos/$REPO/releases/tags/v$VERSION"
+
+  echo "Looking up release v$VERSION..."
+
+  local RELEASE
+  RELEASE=$(curl -fsSL \
+    --retry 3 \
+    --proto '=https' \
+    --tlsv1.2 \
+    -H "Accept: application/vnd.github+json" \
+    "$API") || die "GitHub release v$VERSION not found"
+
+  # Prefer universal macOS CLI builds.
+  # Fall back to architecture-specific builds.
+  local ASSET
+  ASSET=$(print -r -- "$RELEASE" | jq -r --arg arch "$ARCH" --arg cli "$CLI" '
+    [
+      .assets[]
+      | select(
+          (.name | ascii_downcase | contains($cli))
+          and (.name | ascii_downcase | contains("macos"))
+          and (.name | ascii_downcase | endswith(".zip"))
+        )
+    ]
+    | (
+        map(select(.name | ascii_downcase | contains("universal")))
+        + map(select(.name | ascii_downcase | contains($arch)))
+      )
+    | unique_by(.id)
+    | first // empty
+    | [.name, .browser_download_url]
+    | @tsv
+  ')
+
+  if [[ -z "$ASSET" ]]; then
+    echo "Release has no macOS CLI, skipping."
+    exit 0
+  fi
+
+  if [[ "$MODE" == "--check" ]]; then
+    echo "CLI is missing or out of sync."
+    exit 1
+  fi
+
+  local ASSET_NAME="${ASSET%%$'\t'*}"
+  local ASSET_URL="${ASSET#*$'\t'}"
+
+  [[ "$ASSET_NAME" != "$ASSET_URL" ]] \
+    || die "Invalid release asset metadata"
+
+  # Find a supported checksum manifest.
+  local CHECKSUM_URL
+  CHECKSUM_URL=$(print -r -- "$RELEASE" | jq -r '
+    [
+      .assets[]
+      | select(
+          (.name | ascii_downcase) as $n
+          | $n == "sha256sums.txt"
+            or $n == "checksums.txt"
+            or $n == "sha256sums"
+        )
+    ]
+    | first
+    | .browser_download_url // empty
+  ')
+
+  [[ -n "$CHECKSUM_URL" ]] \
+    || die "No supported checksum manifest found; refusing unverified install"
+
+  echo "Asset:        $ASSET_NAME"
+  echo "Architecture: $ARCH"
+
+  if [[ "$MODE" == "--dry-run" ]]; then
+    echo
+    echo "Would download:"
+    echo "  $ASSET_URL"
+    echo "Would verify against:"
+    echo "  $CHECKSUM_URL"
+    echo "Would install to:"
+    echo "  $BIN"
+    exit 0
+  fi
+
+  TMP=$(mktemp -d)
+  STAGE=""
+
+  cleanup() {
+    [[ -z "$STAGE" ]] || rm -f -- "$STAGE"
+    rm -rf -- "$TMP"
+  }
+
+  trap cleanup EXIT
+
+  echo "Downloading CLI..."
+
+  curl -fLsS --retry 3 \
+    --proto '=https' \
+    --tlsv1.2 \
+    "$ASSET_URL" \
+    -o "$TMP/$ASSET_NAME"
+
+  echo "Downloading checksums..."
+
+  curl -fLsS --retry 3 \
+    --proto '=https' \
+    --tlsv1.2 \
+    "$CHECKSUM_URL" \
+    -o "$TMP/checksums.txt"
+
+  local EXPECTED
+  EXPECTED=$(awk -v file="$ASSET_NAME" '
+    $2 == file || $2 == "*" file {
+      print $1
+      exit
+    }
+  ' "$TMP/checksums.txt")
+
+  [[ "$EXPECTED" =~ ^[[:xdigit:]]{64}$ ]] \
+    || die "No valid SHA-256 entry for $ASSET_NAME"
+
+  local ACTUAL
+  ACTUAL=$(shasum -a 256 "$TMP/$ASSET_NAME" | awk '{print $1}')
+
+  [[ "${ACTUAL:l}" == "${EXPECTED:l}" ]] \
+    || die "SHA-256 mismatch"
+
+  echo "SHA-256 verified."
+
+  mkdir -p "$TMP/extracted"
+
+  unzip -q "$TMP/$ASSET_NAME" -d "$TMP/extracted"
+
+  # Locate the CLI executable.
+  local CANDIDATES=("${(@f)$(find "$TMP/extracted" -type f -name "$CLI")}")
+
+  (( ${#CANDIDATES} == 1 )) \
+    || die "Expected exactly one $CLI executable"
+
+  local SOURCE_BIN="${CANDIDATES[1]}"
+
+  chmod +x "$SOURCE_BIN"
+
+  # Validate downloaded executable before installing.
+  local NEW_VERSION
+  NEW_VERSION=$("$SOURCE_BIN" --version 2>/dev/null || true)
+
+  version_matches "$NEW_VERSION" \
+    || die "Downloaded CLI reports unexpected version: $NEW_VERSION"
+
+  mkdir -p "$BIN_DIR"
+
+  # Stage the binary on the destination filesystem.
+  STAGE=$(mktemp "$BIN_DIR/.$CLI.XXXXXXXX")
+
+  cp "$SOURCE_BIN" "$STAGE"
+  chmod 755 "$STAGE"
+
+  # Atomic replacement.
+  mv -f "$STAGE" "$BIN"
+  STAGE=""
+
+  echo
+  echo "Successfully synchronized $NAME!"
+  echo "Desktop: $VERSION"
+  echo "CLI:     $("$BIN" --version)"
+  echo "Path:    $BIN"
+}
+
+[[ -f "$INSTALLED_JSON" ]] \
+  || die "ArtCraft Launcher state not found: $INSTALLED_JSON"
+
+APPS=$(jq -r '.apps | to_entries[] | [.key, .value.path] | @tsv' \
+  "$INSTALLED_JSON") || die "Cannot read $INSTALLED_JSON"
+
+[[ -n "$APPS" ]] || die "ArtCraft Launcher has no installed apps"
+
+FAILED=0
+FIRST=1
+
+for LINE in "${(@f)APPS}"; do
+  (( FIRST )) || echo
+  FIRST=0
+
+  # Keep errexit out of a condition context so it stays active inside.
+  set +e
+  ( sync_app "${LINE%%$'\t'*}" "${LINE#*$'\t'}" )
+  (( $? == 0 )) || FAILED=1
+  set -e
+done
+
+exit $FAILED
